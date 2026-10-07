@@ -12,12 +12,11 @@
 
   /* ---------------- State ---------------- */
   function blank() {
-    return { v: 1, name: "", track: null, blocks: {}, mods: {},
-      final: { answers: {}, submitted: false, score: null, best: null, attempts: 0 },
-      time: { total: 0 }, created: Date.now(), passedAt: null, last: "#/welcome" };
+    return { v: 2, name: "", role: null, fn: null, blocks: {}, mods: {}, finals: {}, passedAt: {},
+      time: { total: 0 }, created: Date.now(), last: "#/welcome" };
   }
   function load() {
-    try { const raw = localStorage.getItem(KEY); if (raw) return Object.assign(blank(), JSON.parse(raw)); } catch (e) { /* corrupt or blocked */ }
+    try { const raw = localStorage.getItem(KEY); if (raw) { const s = Object.assign(blank(), JSON.parse(raw)); if (typeof s.passedAt !== "object" || !s.passedAt) s.passedAt = {}; return s; } } catch (e) { /* corrupt or blocked */ }
     return blank();
   }
   let S = load();
@@ -67,18 +66,54 @@
   function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
   /* ---------------- Course structure helpers ---------------- */
+  /* ---------------- Profile + variant resolution ---------------- */
+  const pk = () => (S.role && S.fn ? S.role + "_" + S.fn : null);
+  const hasProfile = () => !!pk();
+  const profileLabel = () => hasProfile() ? C.roles[S.role].name + " \u00b7 " + C.functions[S.fn].short : "";
+  function res(x) {
+    if (Array.isArray(x)) return x.map(res);
+    if (x && typeof x === "object") {
+      if (x.__v) {
+        const r = S.role || "tl", f = S.fn || "ops";
+        const k = [r + "_" + f, f, r, "all"].find((k) => x[k] !== undefined);
+        return res(k ? x[k] : undefined);
+      }
+      const o = {}; for (const k in x) o[k] = res(x[k]); return o;
+    }
+    return x;
+  }
+  const hasVCache = new WeakMap();
+  function hasV(x) {
+    if (!x || typeof x !== "object") return false;
+    if (hasVCache.has(x)) return hasVCache.get(x);
+    const r = !!x.__v || (Array.isArray(x) ? x.some(hasV) : Object.values(x).some(hasV));
+    hasVCache.set(x, r); return r;
+  }
+  function matchOnly(o) { const p = pk(); return [].concat(o).some((k) => k === "all" || k === S.role || k === S.fn || k === p); }
+  // Resolved blocks for a screen, cached per profile. Tailored blocks get a per-profile state key.
+  const blockCache = new WeakMap();
+  function blocksOf(scr) {
+    const p = pk() || "none", c = blockCache.get(scr);
+    if (c && c.p === p) return c.list;
+    const list = scr.blocks.map((raw) => { const b = res(raw); return { raw, b, key: b.id ? (hasV(raw) ? b.id + "@" + p : b.id) : null }; })
+      .filter((x) => !x.b.only || matchOnly(x.b.only));
+    blockCache.set(scr, { p, list }); return list;
+  }
+  const T = (v) => res(v); // resolve a single value (titles, summaries)
+
   const modById = (id) => C.modules.find((m) => m.id === id);
   const foundationMods = () => C.modules.filter((m) => m.part === "foundation");
-  const trackMods = () => (S.track ? C.modules.filter((m) => m.track === S.track) : []);
+  const trackMods = () => (hasProfile() ? C.modules.filter((m) => m.track === S.role) : []);
   const pathMods = () => foundationMods().concat(trackMods());
-  const reqBlocks = (m) => m.screens.flatMap((s) => s.blocks.filter((b) => INTERACTIVE.has(b.type)));
-  const blockDone = (b) => !!(S.blocks[b.id] && S.blocks[b.id].done);
-  const modPct = (m) => { const r = reqBlocks(m); return r.length ? r.filter(blockDone).length / r.length : 1; };
+  const reqBlocks = (m) => m.screens.flatMap((s) => blocksOf(s).filter((x) => INTERACTIVE.has(x.b.type)));
+  const isDone = (x) => !!(S.blocks[x.key] && S.blocks[x.key].done);
+  const modPct = (m) => { const r = reqBlocks(m); return r.length ? r.filter(isDone).length / r.length : 1; };
   const modDone = (m) => modPct(m) >= 1;
-  const screenOpen = (scr) => scr.blocks.filter((b) => INTERACTIVE.has(b.type) && !blockDone(b));
-  const allPathDone = () => !!S.track && pathMods().every(modDone);
-  const finalQs = () => C.finalCheck.questions.filter((q) => q.track === "all" || q.track === S.track);
-  const passed = () => S.final.best != null && S.final.best >= C.finalCheck.passMark;
+  const screenOpen = (scr) => blocksOf(scr).filter((x) => INTERACTIVE.has(x.b.type) && !isDone(x)).map((x) => x.b);
+  const allPathDone = () => hasProfile() && pathMods().every(modDone);
+  const finalQs = () => res(C.finalCheck.questions).filter((q) => q.track === "all" || q.track === S.role);
+  const Fin = () => { const p = pk() || "none"; return S.finals[p] || (S.finals[p] = { answers: {}, submitted: false, score: null, best: null, attempts: 0 }); };
+  const passed = () => hasProfile() && Fin().best != null && Fin().best >= C.finalCheck.passMark;
 
   /* ---------------- Time tracking ---------------- */
   // Counts only while the tab is visible and the learner was active in the last
@@ -97,7 +132,8 @@
   function parseHash() {
     const p = (location.hash || "").replace(/^#\/?/, "").split("/");
     if (p[0] === "m" && modById(p[1])) return { page: "module", mod: p[1], screen: Math.max(0, parseInt(p[2] || "0", 10) || 0) };
-    if (["welcome", "path", "final", "cert"].includes(p[0])) return { page: p[0] };
+    if (p[0] === "path") return { page: "welcome" };
+    if (["welcome", "final", "cert"].includes(p[0])) return { page: p[0] };
     return null;
   }
   function go(hash) { if (location.hash === hash) render(); else location.hash = hash; }
@@ -107,7 +143,6 @@
   function sequenceHashes() {
     const list = ["#/welcome"];
     foundationMods().forEach((m) => list.push("#/m/" + m.id + "/0"));
-    list.push("#/path");
     trackMods().forEach((m) => list.push("#/m/" + m.id + "/0"));
     list.push("#/final", "#/cert");
     return list;
@@ -134,15 +169,14 @@
     const nav = $("#nav"); nav.innerHTML = "";
     const cur = (p, id) => route.page === p && (!id || route.mod === id);
     nav.append(h("div", { class: "nav-group" }, h("div", { class: "nav-group-label" }, "Start"),
-      navItem("Welcome", "#/welcome", S.name ? 1 : 0, cur("welcome"))));
+      navItem("Welcome and profile", "#/welcome", hasProfile() ? 1 : 0, cur("welcome"))));
     nav.append(h("div", { class: "nav-group" }, h("div", { class: "nav-group-label" }, "Part 1: the foundation"),
-      foundationMods().map((m) => navItem(m.title, "#/m/" + m.id + "/" + resumeScreen(m), modPct(m), cur("module", m.id)))));
-    const g2 = h("div", { class: "nav-group" }, h("div", { class: "nav-group-label" }, "Part 2: your path"),
-      navItem("Choose your path", "#/path", S.track ? 1 : 0, cur("path")));
-    if (S.track) trackMods().forEach((m) => g2.append(navItem(m.title, "#/m/" + m.id + "/" + resumeScreen(m), modPct(m), cur("module", m.id))));
-    else g2.append(h("div", { class: "nav-note" }, "Your modules appear here once you choose a path."));
+      foundationMods().map((m) => navItem(T(m.title), "#/m/" + m.id + "/" + resumeScreen(m), hasProfile() ? modPct(m) : 0, cur("module", m.id), !hasProfile()))));
+    const g2 = h("div", { class: "nav-group" }, h("div", { class: "nav-group-label" }, hasProfile() ? "Part 2: " + C.roles[S.role].name + " path" : "Part 2: your path"));
+    if (hasProfile()) trackMods().forEach((m) => g2.append(navItem(T(m.title), "#/m/" + m.id + "/" + resumeScreen(m), modPct(m), cur("module", m.id))));
+    else g2.append(h("div", { class: "nav-note" }, "Choose your role and function on the Welcome page to see your modules."));
     nav.append(g2);
-    const fpct = passed() ? 1 : S.final.submitted ? 0.5 : 0;
+    const fpct = passed() ? 1 : hasProfile() && Fin().submitted ? 0.5 : 0;
     nav.append(h("div", { class: "nav-group" }, h("div", { class: "nav-group-label" }, "Wrap-up"),
       navItem("Final check", "#/final", fpct, cur("final"), !allPathDone()),
       navItem("Certificate and answers", "#/cert", passed() ? 1 : 0, cur("cert"))));
@@ -154,7 +188,8 @@
     const pm = pathMods(); const done = pm.filter(modDone).length;
     f.innerHTML = "";
     [h("div", null, h("strong", null, fmtTime(S.time.total)), " invested"),
-      h("div", null, S.track ? `${done} of ${pm.length} modules complete` : "Choose a path in Part 2"),
+      hasProfile() ? h("div", { class: "foot-profile" }, h("strong", null, profileLabel()), " ", h("button", { onclick: () => { document.body.classList.remove("nav-open"); go("#/welcome"); setTimeout(() => { const el = document.getElementById("profile"); if (el) el.scrollIntoView({ behavior: "smooth" }); }, 60); } }, "Change")) : null,
+      h("div", null, hasProfile() ? `${done} of ${pm.length} modules complete` : "Choose your profile to begin"),
       storageOK ? null : h("div", { style: "color:#F3B2AD" }, "Progress can't be saved in this browser (private mode or storage blocked)."),
       h("button", { onclick: resetAll }, "Reset my progress")].forEach((el) => { if (el) f.append(el); });
   }
@@ -165,12 +200,16 @@
 
   /* ---------------- Main render ---------------- */
   let lastRouteKey = "";
+  let flash = "";
   function render() {
     let route = parseHash();
     if (!route) { location.replace(S.last && S.last !== location.hash ? S.last : "#/welcome"); return; }
     if (route.page === "module") {
       const m = modById(route.mod);
-      if (m.track !== "all" && m.track !== S.track) { location.replace("#/path"); return; }
+      if (!hasProfile() || (m.track !== "all" && m.track !== S.role)) {
+        flash = !hasProfile() ? "Choose your role and function first, so the course can be built for you."
+          : "“" + T(m.title) + "” is part of the " + C.roles[m.track].name + " path. You're on the " + C.roles[S.role].name + " path; change your role below to open it.";
+        location.replace("#/welcome"); return; }
       route.screen = Math.min(route.screen, m.screens.length - 1);
       const ms = S.mods[m.id] || (S.mods[m.id] = { screen: 0 });
       ms.screen = Math.max(ms.screen || 0, route.screen);
@@ -178,7 +217,7 @@
     S.last = location.hash; save();
     renderNav(route);
     const card = $("#card"); card.innerHTML = "";
-    const pages = { welcome: pageWelcome, path: pagePath, module: pageModule, final: pageFinal, cert: pageCert };
+    const pages = { welcome: pageWelcome, module: pageModule, final: pageFinal, cert: pageCert };
     pages[route.page](card, route);
     const key = JSON.stringify(route);
     if (key !== lastRouteKey) { window.scrollTo(0, 0); lastRouteKey = key; const h1 = $("#card h1"); if (h1) { h1.setAttribute("tabindex", "-1"); h1.focus({ preventScroll: true }); } }
@@ -189,71 +228,91 @@
       h("p", { class: "hero-kicker" }, kicker), h("h1", null, title), sub ? h("p", { class: "hero-sub" }, sub) : null);
   }
 
-  /* ---------------- Page: welcome ---------------- */
+  /* ---------------- Scenario briefing (memorable running story) ---------------- */
+  function initials(name) {
+    const w = name.replace(/^The /, "").split(/\s+/).filter((x) => /^[A-Za-z]/.test(x) && !/^(of|and)$/i.test(x));
+    return (w.length > 1 ? w[0][0] + w[1][0] : w[0].slice(0, 2)).toUpperCase();
+  }
+  function briefingEl(compact) {
+    if (!hasProfile()) return h("div");
+    const p = C.profiles[pk()];
+    return h("section", { class: "briefing" + (compact ? " compact" : ""), "aria-label": "Your scenario" },
+      h("p", { class: "brief-kicker" }, profileLabel() + " \u00b7 your scenario"),
+      h("h3", null, p.change),
+      h("p", { class: "brief-tag" }, p.tagline),
+      h("p", { class: "brief-body" }, p.scenario),
+      h("p", { class: "brief-cast-label" }, S.role === "tl" ? "Your team" : "Your leaders and stakeholders"),
+      h("div", { class: "cast" }, p.cast.map((c) => h("div", { class: "castcard" },
+        h("span", { class: "avatar", "aria-hidden": "true" }, initials(c.name)),
+        h("div", null, h("b", null, c.name), h("small", null, c.role), compact ? null : h("span", { class: "note" }, c.note))))));
+  }
+
+  /* ---------------- Page: welcome + profile ---------------- */
   function pageWelcome(card) {
-    card.append(hero(C.kicker + " \u00b7 About " + C.minutes + " minutes", C.title, C.subtitle));
+    card.append(hero((hasProfile() ? profileLabel() : "Team Leaders and Managers") + " \u00b7 About " + C.minutes + " minutes", C.title, C.subtitle));
     const body = h("div", { class: "body" });
+    if (flash) { body.append(msg("bad", esc(flash))); flash = ""; }
     body.append(
       h("p", { class: "lead" }, "Learn how to lead people through change: translate it into meaning, diagnose what's really blocking adoption, turn resistance into useful information, and make the new way stick."),
-      h("p", { html: "This course is built for <strong>Team Leaders and Managers</strong> in Operations and Support. It takes about " + C.minutes + " minutes, and your progress saves automatically in this browser, so you can stop and come back at any time." }));
-    const nameMsg = h("div");
+      h("p", { html: "This course builds itself around <strong>your role and your function</strong>. Every scenario, example, and decision you practice reflects the work you actually do. Your progress saves automatically in this browser, so you can stop and come back at any time." }));
+
+    // Name
+    const nameMsg = h("div", { id: "name-msg" });
     const input = h("input", { type: "text", id: "learner-name", autocomplete: "name", value: S.name || "", "aria-describedby": "name-msg" });
     const saveName = () => {
       const v = input.value.trim(); nameMsg.innerHTML = "";
       if (!v) { nameMsg.append(msg("bad", "Enter your name so it can appear on your certificate.")); input.focus(); return; }
-      S.name = v; save(true); renderNav({ page: "welcome" }); nameMsg.append(msg("ok", "Saved. Your certificate will read <strong>" + esc(v) + "</strong>."));
+      S.name = v; save(true); nameMsg.append(msg("ok", "Saved. Your certificate will read <strong>" + esc(v) + "</strong>."));
     };
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") saveName(); });
-    nameMsg.id = "name-msg";
     body.append(h("div", { class: "panel" },
       h("label", { class: "field-label", for: "learner-name" }, "Your name, as it should appear on your certificate"),
       h("div", { class: "row" }, input, h("button", { class: "btn", onclick: saveName }, "Save name")), nameMsg));
+
+    // Profile
+    const profMsg = h("div", { id: "profile-msg" });
+    const pick = (kind, id) => { S[kind] = id; save(true); const y = window.scrollY; render(); window.scrollTo(0, y); };
+    const choice = (kind, id, title, label, meta) => h("button", { class: "path", type: "button", "aria-pressed": S[kind] === id ? "true" : "false", "data-pick": kind + ":" + id, onclick: () => pick(kind, id) },
+      h("span", { class: "tick", "aria-hidden": "true" }), meta ? h("p", { class: "meta" }, meta) : null, h("h3", null, title), h("p", null, label));
+    const roleMods = (r) => C.modules.filter((m) => m.track === r).length;
+    body.append(h("section", { id: "profile", class: "profile-picker", "aria-labelledby": "profile-h" },
+      h("h2", { id: "profile-h" }, "Build your course"),
+      h("p", { class: "step-label" }, h("span", { class: "num" }, "1"), "Your role"),
+      h("div", { class: "paths", role: "group", "aria-label": "Your role" },
+        Object.entries(C.roles).map(([id, r]) => choice("role", id, r.name, r.label, roleMods(id) + " path modules after the shared foundation"))),
+      h("p", { class: "step-label" }, h("span", { class: "num" }, "2"), "Your function"),
+      h("div", { class: "paths", role: "group", "aria-label": "Your function" },
+        Object.entries(C.functions).map(([id, f]) => choice("fn", id, f.name, f.label))),
+      profMsg));
+
+    if (hasProfile()) {
+      body.append(h("p", { class: "preview-label" }, "Here's the story you'll lead through the whole course:"), briefingEl(true),
+        h("p", { class: "muted", style: "font-size:15px;margin-top:12px" }, "You can change your profile at any time from the menu. Your work for each profile is saved separately."));
+    }
+
     body.append(h("h2", null, "How it works"),
       h("ol", { class: "steps" },
-        h("li", null, h("span", { class: "num" }, "1"), h("div", { html: "<strong>Part 1: the foundation.</strong> How people experience change, and why resistance is useful information. About 25 minutes." })),
-        h("li", null, h("span", { class: "num" }, "2"), h("div", { html: "<strong>Part 2: your path.</strong> Choose Team Leader or Manager and follow the path built for your role, ending in a capstone and a plan you take back to work. About 50 minutes." })),
+        h("li", null, h("span", { class: "num" }, "1"), h("div", { html: "<strong>Part 1: the foundation.</strong> How people experience change, and why resistance is useful information, shown through your scenario. About 25 minutes." })),
+        h("li", null, h("span", { class: "num" }, "2"), h("div", { html: "<strong>Part 2: your path.</strong> Built for " + (hasProfile() ? "a " + esc(profileLabel()).replace(" \u00b7 ", " in ") : "your role and function") + ", ending in a capstone and a plan you take back to work. About 50 minutes." })),
         h("li", null, h("span", { class: "num" }, "3"), h("div", { html: "<strong>Wrap-up.</strong> A 10-question final check (80% to pass), your certificate, and a PDF of everything you wrote. About 10 minutes." }))),
       h("p", { class: "muted" }, "Each activity ends with coaching key points. If YouTube is blocked on your network, every video has a text summary instead."));
-    const started = Object.keys(S.blocks).length > 0;
+    const started = hasProfile() && Object.keys(S.blocks).some((k) => k.endsWith("@" + pk()) || !k.includes("@"));
     body.append(h("div", { class: "footer-nav" }, h("span"),
-      h("button", { class: "btn", onclick: () => go(started && S.last && S.last !== "#/welcome" ? S.last : "#/m/f1/0") },
-        started ? "Continue where you left off" : "Start Part 1")));
+      h("button", { class: "btn", id: "start-btn", onclick: () => {
+        profMsg.innerHTML = "";
+        const missing = [!S.role && "your role", !S.fn && "your function"].filter(Boolean);
+        if (missing.length) { profMsg.append(msg("bad", "Choose " + missing.join(" and ") + " to build your course.")); document.getElementById("profile").scrollIntoView({ behavior: "smooth" }); return; }
+        const lm = (S.last || "").match(/^#\/m\/([^/]+)/), lmod = lm && modById(lm[1]);
+        if (started && lmod && (lmod.track === "all" || lmod.track === S.role)) return go(S.last);
+        const next = pathMods().find((m) => !modDone(m));
+        go(next ? "#/m/" + next.id + "/" + resumeScreen(next) : "#/final");
+      } }, started ? "Continue where you left off" : "Start my course")));
     card.append(body);
   }
 
-  /* ---------------- Page: choose path ---------------- */
-  function pagePath(card) {
-    card.append(hero("Part 2: your path", "Choose your path", null, true));
-    const body = h("div", { class: "body" });
-    body.append(h("p", { class: "lead" }, "Team Leaders and Managers share the same language for change, but your roles in it are different. Pick the path that matches the work you do."),
-      h("p", null, "Team Leaders translate change and coach individuals day to day. Managers sponsor, align leaders, remove systemic barriers, and sustain outcomes."));
-    const box = h("div", { class: "paths", role: "group", "aria-label": "Choose your path" });
-    const note = h("div");
-    for (const [id, t] of Object.entries(C.tracks)) {
-      const mods = C.modules.filter((m) => m.track === id);
-      box.append(h("button", { class: "path", "aria-pressed": S.track === id ? "true" : "false",
-        onclick: () => { S.track = id; save(true); render(); } },
-        h("span", { class: "tick", "aria-hidden": "true" }),
-        h("p", { class: "meta" }, t.label + " \u00b7 " + mods.length + " modules \u00b7 about " + t.minutes + " min"),
-        h("h3", null, t.name + " path"), h("p", null, t.promise)));
-    }
-    body.append(box, note);
-    if (S.track) {
-      body.append(h("h2", { style: "margin-top:30px" }, "Your " + C.tracks[S.track].name + " modules"), moduleList(trackMods()),
-        h("p", { class: "muted" }, "You can switch paths at any time. Work you've done in either path stays saved."));
-    }
-    body.append(h("div", { class: "footer-nav" },
-      h("button", { class: "btn ghost", onclick: () => go("#/m/f2/" + (modById("f2").screens.length - 1)) }, "Back"),
-      h("button", { class: "btn", onclick: () => {
-        if (!S.track) { note.innerHTML = ""; note.append(msg("bad", "Choose the Team Leader or Manager path to continue.")); return; }
-        const first = trackMods().find((m) => !modDone(m)) || trackMods()[0];
-        go("#/m/" + first.id + "/" + resumeScreen(first));
-      } }, "Start my path")));
-    card.append(body);
-  }
   function moduleList(mods) {
     return h("ul", { class: "modlist" }, mods.map((m) => h("li", null, markerEl(modPct(m)),
-      h("div", { class: "grow" }, h("b", null, m.title), h("small", null, m.summary)),
+      h("div", { class: "grow" }, h("b", null, T(m.title)), h("small", null, T(m.summary))),
       h("span", { class: "pct" }, Math.round(modPct(m) * 100) + "%"))));
   }
 
@@ -262,18 +321,18 @@
     const m = modById(route.mod), idx = route.screen, scr = m.screens[idx];
     const group = m.part === "foundation" ? foundationMods() : trackMods();
     const pos = group.indexOf(m) + 1;
-    const kicker = (m.part === "foundation" ? "Part 1: the foundation" : C.tracks[S.track].name + " path") + " \u00b7 " +
+    const kicker = (m.part === "foundation" ? "Part 1: the foundation" : C.roles[S.role].name + " path") + " \u00b7 " + C.functions[S.fn].short + " \u00b7 " +
       (m.capstone ? "Capstone" : "Module " + pos + " of " + group.filter((x) => !x.capstone).length) + " \u00b7 About " + m.minutes + " min";
-    const hd = hero(kicker, m.title, null, true);
+    const hd = hero(kicker, T(m.title), null, true);
     const bars = h("div", { class: "bars", "aria-hidden": "true" });
     m.screens.forEach((s, i) => bars.append(h("span", { class: i === idx ? "here" : screenOpen(s).length === 0 && (S.mods[m.id].screen >= i) ? "done" : (S.mods[m.id].screen >= i ? "seen" : "") })));
-    hd.append(bars, h("p", { class: "bars-label" }, "Screen " + (idx + 1) + " of " + m.screens.length + ": " + scr.title));
+    hd.append(bars, h("p", { class: "bars-label" }, "Screen " + (idx + 1) + " of " + m.screens.length + ": " + T(scr.title)));
     card.append(hd);
 
     const body = h("div", { class: "body" });
-    if (idx === 0) body.append(h("p", { class: "lead" }, m.summary));
-    body.append(h("h2", null, scr.title));
-    for (const b of scr.blocks) body.append(renderBlock(b, () => onBlockChange(m)));
+    if (idx === 0) body.append(h("p", { class: "lead" }, T(m.summary)));
+    body.append(h("h2", null, T(scr.title)));
+    for (const x of blocksOf(scr)) body.append(renderBlock(x, () => onBlockChange(m)));
 
     const gate = h("div", { class: "gate-msg" });
     const isLast = idx === m.screens.length - 1;
@@ -304,8 +363,10 @@
   }
 
   /* ---------------- Block dispatcher ---------------- */
-  function renderBlock(b, changed) {
+  function renderBlock(x, changed) {
+    const b = x.b;
     switch (b.type) {
+      case "briefing": return briefingEl(false);
       case "p": return h("p", { html: b.html });
       case "announce": return h("blockquote", { class: "announce", html: b.html });
       case "list": return h("ul", { class: "prose" }, b.items.map((i) => h("li", { html: i })));
@@ -316,7 +377,7 @@
       default: {
         const fn = R[b.type];
         if (!fn) return h("p", null, "[Unknown block: " + b.type + "]");
-        const st = bs(b.id);
+        const st = bs(x.key);
         const ctx = {
           save: () => save(),
           complete: () => { if (!st.done) { st.done = true; st.doneAt = Date.now(); } save(true); changed(); },
@@ -943,29 +1004,29 @@
     const body = h("div", { class: "body" });
     if (!allPathDone()) {
       body.append(h("p", { class: "lead" }, "The final check unlocks when you've completed Part 1 and every module in your path."));
-      if (!S.track) body.append(msg("info", "You haven't chosen a path yet."), h("div", { class: "act-actions" }, h("button", { class: "btn", onclick: () => go("#/path") }, "Choose your path")));
+      if (!hasProfile()) body.append(msg("info", "You haven't chosen your profile yet."), h("div", { class: "act-actions" }, h("button", { class: "btn", onclick: () => go("#/welcome") }, "Choose my profile")));
       else {
         body.append(h("h2", { style: "font-size:21px" }, "Still to complete"),
           h("ul", { class: "modlist" }, pathMods().filter((m) => !modDone(m)).map((m) => h("li", null, markerEl(modPct(m)),
-            h("div", { class: "grow" }, h("b", null, m.title), h("small", null, Math.round(modPct(m) * 100) + "% complete")),
+            h("div", { class: "grow" }, h("b", null, T(m.title)), h("small", null, Math.round(modPct(m) * 100) + "% complete")),
             h("button", { class: "btn small ghost", onclick: () => go("#/m/" + m.id + "/" + resumeScreen(m)) }, "Open")))));
       }
       card.append(body); return;
     }
     const qs = finalQs();
-    body.append(h("p", { class: "lead" }, qs.length + " questions drawn from Part 1 and your " + C.tracks[S.track].name + " path. You need " + C.finalCheck.passMark + "% to earn your certificate, and you can retake it."),
-      S.final.best != null ? h("p", { class: "muted" }, "Best score so far: " + S.final.best + "% across " + S.final.attempts + " attempt" + (S.final.attempts > 1 ? "s" : "") + ".") : null);
-    const F = S.final;
+    const F = Fin();
+    body.append(h("p", { class: "lead" }, qs.length + " questions drawn from Part 1 and your " + profileLabel() + " path. You need " + C.finalCheck.passMark + "% to earn your certificate, and you can retake it."),
+      F.best != null ? h("p", { class: "muted" }, "Best score so far: " + F.best + "% across " + F.attempts + " attempt" + (F.attempts > 1 ? "s" : "") + ".") : null);
     body.append(quizUI(qs, F, { name: "final", big: true, save: () => save(), submitLabel: "Submit final check",
       scoreNote: () => (F.score >= C.finalCheck.passMark ? ". You passed." : ". You need " + C.finalCheck.passMark + "% to pass. Review the explanations and retake when you're ready."),
-      onSubmit: () => { if (F.best >= C.finalCheck.passMark && !S.passedAt) S.passedAt = Date.now(); save(true); renderNav({ page: "final" }); },
+      onSubmit: () => { if (F.best >= C.finalCheck.passMark && !S.passedAt[pk()]) S.passedAt[pk()] = Date.now(); save(true); renderNav({ page: "final" }); },
       after: () => (F.score >= C.finalCheck.passMark || passed()) ? h("button", { class: "btn small", onclick: () => go("#/cert") }, "Get my certificate") : null }));
     card.append(body);
   }
 
   /* ---------------- Page: certificate and answers ---------------- */
   function cfuScores() {
-    return pathMods().flatMap((m) => m.screens.flatMap((s) => s.blocks.filter((b) => b.type === "quiz").map((b) => ({ m, b, st: S.blocks[b.id] }))));
+    return pathMods().flatMap((m) => m.screens.flatMap((s) => blocksOf(s).filter((x) => x.b.type === "quiz").map((x) => ({ m, b: x.b, st: S.blocks[x.key] }))));
   }
   function pageCert(card) {
     card.append(hero("Wrap-up", "Certificate and answers", null, true));
@@ -974,13 +1035,13 @@
     const cfuAvg = cfus.length ? Math.round(cfus.reduce((a, x) => a + x.st.best, 0) / cfus.length) : null;
     body.append(h("div", { class: "stats" },
       h("div", { class: "stat" }, h("small", null, "Time invested"), h("b", null, fmtTime(S.time.total))),
-      h("div", { class: "stat" }, h("small", null, "Final check (best)"), h("b", null, S.final.best != null ? S.final.best + "%" : "Not taken")),
+      h("div", { class: "stat" }, h("small", null, "Final check (best)"), h("b", null, hasProfile() && Fin().best != null ? Fin().best + "%" : "Not taken")),
       h("div", { class: "stat" }, h("small", null, "Checks for understanding"), h("b", null, cfuAvg != null ? cfuAvg + "%" : "None yet"))));
 
     body.append(h("h2", null, "Your certificate"));
     if (!passed()) {
       body.append(msg("info", "Your certificate unlocks when you score " + C.finalCheck.passMark + "% or higher on the final check." + (allPathDone() ? "" : " Complete your path modules first to unlock the final check.")),
-        h("div", { class: "act-actions" }, h("button", { class: "btn small", onclick: () => go(allPathDone() ? "#/final" : "#/path") }, allPathDone() ? "Go to the final check" : "Continue my path")));
+        h("div", { class: "act-actions" }, h("button", { class: "btn small", onclick: () => go(allPathDone() ? "#/final" : (hasProfile() ? S.last : "#/welcome")) }, allPathDone() ? "Go to the final check" : "Continue my path")));
     } else {
       const out = h("div");
       const input = h("input", { type: "text", id: "cert-name", value: S.name || "", autocomplete: "name" });
@@ -1010,7 +1071,7 @@
       catch (e) { console.error(e); pout.append(msg("bad", "The PDF couldn't be created: " + esc(e.message))); }
     } }, "Download PDF of my answers")), pout);
 
-    if (S.track) body.append(h("h2", { style: "margin-top:38px" }, "Your progress"), moduleList(pathMods()));
+    if (hasProfile()) body.append(h("h2", { style: "margin-top:38px" }, "Your progress"), moduleList(pathMods()));
     card.append(body);
   }
   function downloadBlob(blob, name) {
@@ -1049,11 +1110,11 @@
     x.fillStyle = "#101E38"; x.fillText(name, 110, 530);
     x.fillStyle = "#68D1C7"; x.fillRect(110, 560, Math.min(x.measureText(name).width, W - 220), 6);
     x.fillStyle = "#2A384D"; x.font = "400 32px " + F;
-    x.fillText("has completed the " + (S.track ? C.tracks[S.track].name + " path" : "course") + " of Managing Change, including the", 110, 635);
-    x.fillText("foundation modules, a capstone, and the graded final check.", 110, 680);
+    x.fillText("has completed Managing Change: the " + (hasProfile() ? C.roles[S.role].name + " path for " + C.functions[S.fn].name : "course") + ",", 110, 635);
+    x.fillText("including the foundation modules, a capstone, and the graded final check.", 110, 680);
     // stats
-    const date = new Date(S.passedAt || Date.now()).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
-    const stats = [["Date completed", date], ["Time invested", fmtTime(S.time.total)], ["Knowledge check score", (S.final.best != null ? S.final.best : 0) + "%"]];
+    const date = new Date(S.passedAt[pk()] || Date.now()).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+    const stats = [["Date completed", date], ["Time invested", fmtTime(S.time.total)], ["Knowledge check score", (Fin().best != null ? Fin().best : 0) + "%"]];
     stats.forEach(([k, v], i) => {
       const sx = 110 + i * 470;
       x.fillStyle = "#EFF4F7"; roundRect(x, sx, 760, 430, 150, 18); x.fill();
@@ -1117,23 +1178,25 @@
     page.drawText("From Resistance to Readiness | My answers and results", { x: M, y: PH - 104, size: 12, font: reg, color: rgb(0.41, 0.82, 0.78) });
     y = PH - 180;
     text("Learner: " + (S.name || "(name not entered)"), { font: bold, size: 12, color: INK, gap: 2 });
-    text("Path: " + (S.track ? C.tracks[S.track].name : "Not chosen"), { gap: 2 });
+    text("Profile: " + (hasProfile() ? C.roles[S.role].name + ", " + C.functions[S.fn].name + " (scenario: " + C.profiles[pk()].change + ")" : "Not chosen"), { gap: 2 });
     text("Generated: " + new Date().toLocaleString(), { gap: 2 });
     text("Time invested: " + fmtTime(S.time.total), { gap: 2 });
-    text("Final check: " + (S.final.best != null ? "best " + S.final.best + "% (" + S.final.attempts + " attempt" + (S.final.attempts > 1 ? "s" : "") + ", pass mark " + C.finalCheck.passMark + "%)" + (passed() ? ", passed" : ", not yet passed") : "not taken"), { gap: 2 });
+    const FF = Fin();
+    text("Final check: " + (FF.best != null ? "best " + FF.best + "% (" + FF.attempts + " attempt" + (FF.attempts > 1 ? "s" : "") + ", pass mark " + C.finalCheck.passMark + "%)" + (passed() ? ", passed" : ", not yet passed") : "not taken"), { gap: 2 });
     const cf = cfuScores().filter((x) => x.st && x.st.best != null);
-    text("Checks for understanding: " + (cf.length ? cf.map((x) => x.m.title + " " + x.st.best + "%").join("; ") : "none completed"), { gap: 12 });
+    text("Checks for understanding: " + (cf.length ? cf.map((x) => T(x.m.title) + " " + x.st.best + "%").join("; ") : "none completed"), { gap: 12 });
 
-    const mods = S.track ? pathMods() : foundationMods();
+    const mods = hasProfile() ? pathMods() : foundationMods();
     for (const m of mods) {
       space(8);
       if (y < M + 80) newPage();
       page.drawRectangle({ x: M, y: y - 4, width: 4, height: 18, color: TEAL });
-      text(m.title, { font: bold, size: 15, color: INK, indent: 12, gap: 2 });
+      text(T(m.title), { font: bold, size: 15, color: INK, indent: 12, gap: 2 });
       text(Math.round(modPct(m) * 100) + "% complete", { size: 9, color: MUT, indent: 12, gap: 8 });
-      for (const scr of m.screens) for (const b of scr.blocks) {
+      for (const scr of m.screens) for (const xb of blocksOf(scr)) {
+        const b = xb.b;
         if (!INTERACTIVE.has(b.type)) continue;
-        const st = S.blocks[b.id] || {};
+        const st = S.blocks[xb.key] || {};
         const status = st.done ? "Completed" : "Not completed";
         const head = (t) => text(t, { font: bold, size: 11, color: INK, gap: 2 });
         const ans = (t) => text(t && String(t).trim() ? t : "(no answer)", { indent: 10, gap: 6, color: t && String(t).trim() ? TXT : MUT });
@@ -1168,6 +1231,8 @@
     render();
   }
   // Exposed for automated QA only.
-  window.__course = { get state() { return S; }, save: () => save(true), fmtTime };
+  window.__course = { get state() { return S; }, save: () => save(true), fmtTime, pk,
+    block: (id) => { for (const m of C.modules) for (const s of m.screens) for (const x of blocksOf(s)) if (x.b.id === id) return Object.assign({}, x.b, { __key: x.key }); return null; },
+    finalQs: () => finalQs(), final: () => Fin() };
   boot();
 })();

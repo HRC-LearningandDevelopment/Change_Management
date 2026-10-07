@@ -10,7 +10,7 @@
    After editing, bump ?v=N on this file's <script> tag in index.html.
    ========================================================================= */
 window.COURSE_CONFIG = {
-  storageKey: "hrc-managing-change-v1",
+  storageKey: "hrc-managing-change-v2",
   videos: {
     VIDEO_1: {
       url: "[VIDEO_1_URL]",
